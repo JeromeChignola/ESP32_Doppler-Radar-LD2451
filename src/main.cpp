@@ -8,10 +8,14 @@
 #include <algorithm>
 #include <ctime>
 #include "esp_system.h"
+#include <PubSubClient.h>
 #include "wifi_cfg.h"
+#include "mqtt_cfg.h"
 
 // ========================= CONFIG WIFI =========================
 #include "config.h"
+struct Passage;  // forward decl for prototype below
+static void mqttPublishPass(const Passage& p);
 
 static const char* TZ_EUROPE_PARIS = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
@@ -284,7 +288,7 @@ static void maybeRecordPassageFromTargets(const std::vector<Passage>& candidates
   if (candidates.empty()) return;
   uint32_t nowMs=millis(); if (nowMs - g_lastPassMs < PASS_DEBOUNCE_MS) return;
   const Passage* best=&candidates[0]; for (const auto& c: candidates) if (c.speed_kmh>best->speed_kmh) best=&c;
-  Passage p=*best; p.ts=nowLocal(); g_passes.push_back(p); if (g_passes.size()>MAX_PASSES) g_passes.erase(g_passes.begin()); appendCSV(p); g_lastPassMs=nowMs;
+  Passage p=*best; p.ts=nowLocal(); g_passes.push_back(p); mqttPublishPass(g_passes.back()); if (g_passes.size()>MAX_PASSES) g_passes.erase(g_passes.begin()); appendCSV(p); g_lastPassMs=nowMs;
   Serial.printf("[PASS] %s v=%u d=%u θ=%d @ %s\n", p.dir?"approach":"away", p.speed_kmh, p.dist_m, (int)p.angle, fmtDate(p.ts).c_str());
 }
 void parseDataFrame(const uint8_t* p, size_t n){
@@ -345,6 +349,12 @@ size_t tryParseOne(){
 // ========================= SERVEUR WEB =========================
 WebServer server(80);
 
+// MQTT client
+WiFiClient g_net;
+PubSubClient g_mqtt(g_net);
+static MqttCfg::Settings g_mq;
+static uint32_t g_mqttNextTry = 0;
+
 // Reboot scheduling after Wi‑Fi save
 static bool g_rebootPending = false;
 static uint32_t g_rebootAt = 0;
@@ -352,10 +362,73 @@ static uint32_t g_rebootAt = 0;
 // ----------- PAGE 1 : PASSAGES & STATS (auto-
 #include "web_ui.h"
 
+
+// ---------------- MQTT helpers ------------------------------
+static String devId(){
+  String id = String((uint32_t)ESP.getEfuseMac(), HEX);
+  id.toUpperCase();
+  return id;
+}
+static String topic(const String& leaf){
+  String base = g_mq.base.length()? g_mq.base : String("radar/") + devId();
+  if (base.endsWith("/")) return base + leaf;
+  return base + "/" + leaf;
+}
+static void publishJSON(const String& t, const String& json, bool retain=false){
+  if (g_mqtt.connected()) g_mqtt.publish(t.c_str(), json.c_str(), retain);
+}
+static void publishStr(const String& t, const String& s, bool retain=false){
+  if (g_mqtt.connected()) g_mqtt.publish(t.c_str(), s.c_str(), retain);
+}
+static void publishHAConfig(){
+  if (!g_mq.discovery) return;
+  String id = devId();
+  String device = String("{\"identifiers\":[\"RADAR-")+id+"\"],\"name\":\"LD2451 Radar "+id+"\",\"manufacturer\":\"DIY\",\"model\":\"HLK-LD2451\"}";
+  String cfgSpeed = String("{\"name\":\"Radar Speed\",\"uniq_id\":\"radar_")+id+String("_speed\",\"stat_t\":\"")+topic("last")+String("\",\"json_attr_t\":\"")+topic("last")+String("\",\"unit_of_meas\":\"km/h\",\"val_tpl\":\"{{ value_json.speed_kmh }}\",\"avty_t\":\"")+topic("status")+String("\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"device\":")+device+"}";
+  publishStr(String("homeassistant/sensor/")+id+String("/speed/config"), cfgSpeed, true);
+  String cfgDist = String("{\"name\":\"Radar Distance\",\"uniq_id\":\"radar_")+id+String("_dist\",\"stat_t\":\"")+topic("last")+String("\",\"unit_of_meas\":\"m\",\"val_tpl\":\"{{ value_json.dist_m }}\",\"avty_t\":\"")+topic("status")+String("\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"device\":")+device+"}";
+  publishStr(String("homeassistant/sensor/")+id+String("/distance/config"), cfgDist, true);
+  String cfgAng = String("{\"name\":\"Radar Angle\",\"uniq_id\":\"radar_")+id+String("_ang\",\"stat_t\":\"")+topic("last")+String("\",\"unit_of_meas\":\"°\",\"val_tpl\":\"{{ value_json.angle }}\",\"avty_t\":\"")+topic("status")+String("\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"device\":")+device+"}";
+  publishStr(String("homeassistant/sensor/")+id+String("/angle/config"), cfgAng, true);
+  String cfgCnt = String("{\"name\":\"Radar Passes\",\"uniq_id\":\"radar_")+id+String("_count\",\"stat_t\":\"")+topic("count")+String("\",\"avty_t\":\"")+topic("status")+String("\",\"pl_avail\":\"online\",\"pl_not_avail\":\"offline\",\"device\":")+device+"}";
+  publishStr(String("homeassistant/sensor/")+id+String("/count/config"), cfgCnt, true);
+}
+static void mqttOnConnect(){
+  publishStr(topic("status"), "online", true);
+  publishHAConfig();
+  publishStr(topic("count"), String((unsigned)g_passes.size()), true);
+}
+static void mqttEnsureConnected(){
+  if (!g_mq.enabled) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (g_mqtt.connected()) { g_mqtt.loop(); return; }
+  uint32_t now = millis();
+  if (now < g_mqttNextTry) return;
+  g_mqtt.setServer(g_mq.host.c_str(), g_mq.port ? g_mq.port : 1883);
+  String willTopic = topic("status");
+  g_mqtt.connect(("RADAR-"+devId()).c_str(),
+                 g_mq.user.length()? g_mq.user.c_str(): nullptr,
+                 g_mq.user.length()? g_mq.pass.c_str(): nullptr,
+                 willTopic.c_str(), 0, true, "offline");
+  g_mqttNextTry = now + 5000;
+  if (g_mqtt.connected()) mqttOnConnect();
+}
+static void mqttPublishPass(const Passage& p){
+  if (!g_mqtt.connected()) return;
+  String j = String("{\"ts\":\"")+fmtDate(p.ts)+"\",\"dir\":"+(p.dir?String(1):String(0))+
+             ",\"speed_kmh\":"+String(p.speed_kmh)+",\"dist_m\":"+String(p.dist_m)+
+             ",\"angle\":"+String((int)p.angle)+",\"snr\":"+String(p.snr)+"}";
+  publishJSON(topic("last"), j, true);
+  publishStr(topic("count"), String((unsigned)g_passes.size()), true);
+}
+
 // ----------- PAGE 2 : CONFIGURATION (pas d’au
 // ---------------- API Passages / Options -----------------------
 void handleWifiGet();
 void handleWifiSet();
+void handleMqttGet();
+void handleMqttSet();
+static void mqttPublishPass(const Passage& p);
 void handlePasses(){
   String j="["; for(size_t i=0;i<g_passes.size();++i){ const auto& p=g_passes[i]; if(i) j+=','; j+="{\"epoch\":"+String((long)p.ts)+",\"datetime\":\""+fmtDate(p.ts)+"\",\"dir\":"+(p.dir?String(1):String(0))+
     ",\"speed_kmh\":"+String(p.speed_kmh)+",\"dist_m\":"+String(p.dist_m)+",\"angle_deg\":"+String((int)p.angle)+",\"snr\":"+String(p.snr)+"}"; } j+="]";
@@ -542,9 +615,12 @@ void setup() {
 
   // diag
   server.on("/api/diag/ping", HTTP_GET, handleDiagPing);
+  server.on("/api/mqtt/get", HTTP_GET, handleMqttGet);
+  server.on("/api/mqtt/set", HTTP_GET, handleMqttSet);
 
     server.on("/api/wifi/get", HTTP_GET, handleWifiGet);
   server.on("/api/wifi/set", HTTP_GET, handleWifiSet);
+  g_mq = MqttCfg::load();
   server.begin(); Serial.println("[WEB] http server started");
 }
 
@@ -552,6 +628,7 @@ void loop() {
   while (Serial2.available()){ uint8_t b=(uint8_t)Serial2.read(); rx.push_back(b); ST.bytes_rx++; if (rx.size()>4096) rx.erase(rx.begin(), rx.begin()+2048); }
   while (tryParseOne()) {}
   server.handleClient();
+  mqttEnsureConnected();
   if (g_rebootPending && millis() >= g_rebootAt) { ESP.restart(); }
   static uint32_t hb=0; if (millis()-hb>30000){ hb=millis(); Serial.printf("[HB] bytes=%lu data=%lu ack=%lu pass=%u baud=%u\n",
     (unsigned long)ST.bytes_rx,(unsigned long)ST.frames_data,(unsigned long)ST.frames_ack,(unsigned)g_passes.size(),(unsigned)g_uart_baud); }
@@ -571,6 +648,34 @@ void handleWifiSet(){
   if (pass.length() == 0) pass = cur.pass;
   bool ok = WifiCfg::save(ssid, pass);
   server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "ERR");
+  if (ok) { g_rebootPending = true; g_rebootAt = millis() + 800; }
+}
+
+
+// ---------------- MQTT API (definitions) -----------------------
+void handleMqttGet(){
+  g_mq = MqttCfg::load();
+  String j = String("{\"enabled\":") + (g_mq.enabled?"true":"false") +
+             ",\"host\":\""+ g_mq.host + "\"" +
+             ",\"port\":"+ String((unsigned)g_mq.port) +
+             ",\"user\":\""+ g_mq.user + "\"" +
+             ",\"base\":\""+ g_mq.base + "\"" +
+             ",\"discovery\":"+ (g_mq.discovery?"true":"false") +
+             "}";
+  server.send(200, "application/json", j);
+}
+
+void handleMqttSet(){
+  MqttCfg::Settings s = MqttCfg::load();
+  if (server.hasArg("enabled")) s.enabled = (server.arg("enabled")=="1");
+  if (server.hasArg("host"))    s.host = server.arg("host");
+  if (server.hasArg("port"))    s.port = (uint16_t)constrain(server.arg("port").toInt(), 1, 65535);
+  if (server.hasArg("user"))    s.user = server.arg("user");
+  if (server.hasArg("pass")){   String np = server.arg("pass"); if (np.length()>0) s.pass = np; }
+  if (server.hasArg("base"))    s.base = server.arg("base");
+  if (server.hasArg("disc"))    s.discovery = (server.arg("disc")=="1");
+  bool ok = MqttCfg::save(s);
+  server.send(ok?200:500, "text/plain", ok?"OK":"ERR");
   if (ok) { g_rebootPending = true; g_rebootAt = millis() + 800; }
 }
 

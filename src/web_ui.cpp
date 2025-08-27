@@ -196,6 +196,22 @@ input[type="number"]{width:110px}
     </div>
   </div>
 
+
+  <div class="card" style="flex:1;min-width:320px">
+    <h2>MQTT (Home Assistant)</h2>
+    <div class="switch"><input id="mqtt_enabled" type="checkbox"><label for="mqtt_enabled">Activer MQTT</label></div>
+    <label>Hôte (broker)<br><input id="mqtt_host" type="text" placeholder="ha.local ou 192.168.x.x"></label><br>
+    <label>Port<br><input id="mqtt_port" type="number" value="1883" min="1" max="65535" style="width:120px"></label><br>
+    <label>Utilisateur<br><input id="mqtt_user" type="text" placeholder="(facultatif)"></label><br>
+    <label>Mot de passe<br><input id="mqtt_pass" type="password" placeholder="(inchangé si vide)"></label><br>
+    <label>Base topic<br><input id="mqtt_base" type="text" placeholder="radar/ld2451"></label>
+    <div class="switch" style="margin-top:8px"><input id="mqtt_disc" type="checkbox" checked><label for="mqtt_disc">Découverte HA (auto-entities)</label></div>
+    <div style="margin-top:10px">
+      <button onclick="mqttSave()">Sauver &amp; redémarrer</button>
+      <span id="mqtt_msg" style="margin-left:10px;color:#93c5fd"></span>
+    </div>
+  </div>
+
 </main>
 <script>
 async function getJSON(u){const r=await fetch(u); return r.json();}
@@ -249,6 +265,48 @@ async function wifiSave(){
 }
 
 window.addEventListener('load', wifiLoad);
+
+async function mqttLoad(){
+  try{
+    const r = await fetch('/api/mqtt/get');
+    if(!r.ok) return;
+    const j = await r.json();
+    document.getElementById('mqtt_enabled').checked = !!j.enabled;
+    document.getElementById('mqtt_host').value = j.host||'';
+    document.getElementById('mqtt_port').value = j.port||1883;
+    document.getElementById('mqtt_user').value = j.user||'';
+    document.getElementById('mqtt_base').value = j.base||'';
+    document.getElementById('mqtt_disc').checked = !!j.discovery;
+  }catch(e){}
+}
+async function mqttSave(){
+  const msg = document.getElementById('mqtt_msg');
+  const en = document.getElementById('mqtt_enabled').checked ? 1 : 0;
+  const host = document.getElementById('mqtt_host').value.trim();
+  const port = parseInt(document.getElementById('mqtt_port').value||'1883',10);
+  const user = document.getElementById('mqtt_user').value.trim();
+  const pass = document.getElementById('mqtt_pass').value;
+  const base = document.getElementById('mqtt_base').value.trim();
+  const disc = document.getElementById('mqtt_disc').checked ? 1 : 0;
+  msg.innerText = 'Sauvegarde...';
+  const p = new URLSearchParams();
+  p.set('enabled', en);
+  p.set('host', host);
+  p.set('port', port);
+  p.set('user', user);
+  p.set('pass', pass);
+  p.set('base', base);
+  p.set('disc', disc);
+  const r = await fetch('/api/mqtt/set?' + p.toString());
+  if (r.ok){
+    msg.innerText = 'OK, redémarrage...';
+    setTimeout(()=>{ msg.innerText='Redémarrage en cours...'; }, 300);
+  }else{
+    msg.innerText = 'Erreur';
+  }
+}
+
+window.addEventListener('load', mqttLoad);
 </script>
 </body></html>
 
