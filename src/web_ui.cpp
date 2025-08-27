@@ -212,6 +212,35 @@ input[type="number"]{width:110px}
     </div>
   </div>
 
+
+  <div class="card" style="flex:1;min-width:320px">
+    <h2>Alimentation &amp; Système</h2>
+    <label>CPU (MHz)<br>
+      <select id="cpu">
+        <option value="80">80</option>
+        <option value="160">160</option>
+        <option value="240" selected>240</option>
+      </select>
+    </label><br>
+    <label>Mode de veille<br>
+      <select id="slm">
+        <option value="1">Modem sleep</option>
+        <option value="2">Light sleep</option>
+        <option value="3">Wi‑Fi OFF quand idle</option>
+      </select>
+    </label><br>
+
+    <div class="switch"><input id="mdns" type="checkbox" checked><label for="mdns">Activer mDNS</label></div>
+    <div class="switch"><input id="wsl" type="checkbox" checked><label for="wsl">Activer Wi‑Fi sleep</label></div>
+    <label>GPIO override désactivation sleep<br><input id="gpio" type="number" value="-1" style="width:120px"></label><br>
+    <div class="switch"><input id="gah" type="checkbox" checked><label for="gah">Override actif sur niveau HAUT</label></div>
+    <small>Note&nbsp;: si le LD2451 n'est pas détecté, le sleep est désactivé automatiquement.</small>
+    <div style="margin-top:10px">
+      <button onclick="powerSave()">Sauver &amp; redémarrer</button>
+      <span id="pmsg" style="margin-left:10px;color:#93c5fd"></span>
+    </div>
+  </div>
+
 </main>
 <script>
 async function getJSON(u){const r=await fetch(u); return r.json();}
@@ -241,6 +270,7 @@ async function wifiLoad(){
     const r = await fetch('/api/wifi/get'); 
     if(!r.ok) return;
     const j = await r.json();
+    if (j.sleep_mode) document.getElementById('slm').value = String(j.sleep_mode);
     if(j && j.ssid!==undefined){
       document.getElementById('wifi_ssid').value = j.ssid || '';
     }
@@ -271,6 +301,7 @@ async function mqttLoad(){
     const r = await fetch('/api/mqtt/get');
     if(!r.ok) return;
     const j = await r.json();
+    if (j.sleep_mode) document.getElementById('slm').value = String(j.sleep_mode);
     document.getElementById('mqtt_enabled').checked = !!j.enabled;
     document.getElementById('mqtt_host').value = j.host||'';
     document.getElementById('mqtt_port').value = j.port||1883;
@@ -306,7 +337,42 @@ async function mqttSave(){
   }
 }
 
+
+async function powerLoad(){
+  try{
+    const r = await fetch('/api/power/get');
+    if(!r.ok) return;
+    const j = await r.json();
+    if (j.sleep_mode) document.getElementById('slm').value = String(j.sleep_mode);
+    const cpuSel = document.getElementById('cpu');
+    if (j.cpu_mhz) cpuSel.value = String(j.cpu_mhz);
+    document.getElementById('mdns').checked = !!j.mdns;
+    document.getElementById('wsl').checked = !!j.wifi_sleep;
+    document.getElementById('gpio').value = (j.sleep_gpio!==undefined? j.sleep_gpio : -1);
+    document.getElementById('gah').checked = !!j.sleep_gpio_ah;
+  }catch(e){}
+}
+async function powerSave(){
+  const msg = document.getElementById('pmsg');
+  msg.innerText = 'Sauvegarde...';
+  const p = new URLSearchParams();
+  p.set('cpu', document.getElementById('cpu').value);
+  p.set('mdns', document.getElementById('mdns').checked ? 1 : 0);
+  p.set('wsl', document.getElementById('wsl').checked ? 1 : 0);
+  p.set('gpio', document.getElementById('gpio').value);
+  p.set('gah', document.getElementById('gah').checked ? 1 : 0);
+  p.set('slm', document.getElementById('slm').value);
+  const r = await fetch('/api/power/set?' + p.toString());
+  if (r.ok){
+    msg.innerText = 'OK, redémarrage...';
+    setTimeout(()=>{ msg.innerText='Redémarrage en cours...'; }, 300);
+  }else{
+    msg.innerText = 'Erreur';
+  }
+}
+
 window.addEventListener('load', mqttLoad);
+window.addEventListener('load', powerLoad);
 </script>
 </body></html>
 

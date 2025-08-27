@@ -8,16 +8,25 @@
 #include <algorithm>
 #include <ctime>
 #include "esp_system.h"
+#include <esp_sleep.h>
+#include <esp_wifi.h>
 #include <PubSubClient.h>
-#include "wifi_cfg.h"
+#include "power_cfg.h"
 #include "mqtt_cfg.h"
+#include "wifi_cfg.h"
 
 // ========================= CONFIG WIFI =========================
 #include "config.h"
-struct Passage;  // forward decl for prototype below
+struct Passage;
+extern PowerCfg::Settings g_pw;
+static uint32_t lastActiveMs = 0;
 static void mqttPublishPass(const Passage& p);
+void handlePowerDiag();
+static void maybeDoLightSleep();
+bool g_ld2451_ok = false;   // définition unique, PAS "static"
 
 static const char* TZ_EUROPE_PARIS = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+static inline void bumpActivity(){ lastActiveMs = millis(); }
 
 // ========================= UART RADAR ==========================
 #define RADAR_RX 16  // ESP32 RX2  <= Radar TX
@@ -288,7 +297,7 @@ static void maybeRecordPassageFromTargets(const std::vector<Passage>& candidates
   if (candidates.empty()) return;
   uint32_t nowMs=millis(); if (nowMs - g_lastPassMs < PASS_DEBOUNCE_MS) return;
   const Passage* best=&candidates[0]; for (const auto& c: candidates) if (c.speed_kmh>best->speed_kmh) best=&c;
-  Passage p=*best; p.ts=nowLocal(); g_passes.push_back(p); mqttPublishPass(g_passes.back()); if (g_passes.size()>MAX_PASSES) g_passes.erase(g_passes.begin()); appendCSV(p); g_lastPassMs=nowMs;
+  Passage p=*best; p.ts=nowLocal(); g_passes.push_back(p); g_ld2451_ok=true; mqttPublishPass(g_passes.back()); if (g_passes.size()>MAX_PASSES) g_passes.erase(g_passes.begin()); appendCSV(p); bumpActivity(); g_lastPassMs=nowMs;
   Serial.printf("[PASS] %s v=%u d=%u θ=%d @ %s\n", p.dir?"approach":"away", p.speed_kmh, p.dist_m, (int)p.angle, fmtDate(p.ts).c_str());
 }
 void parseDataFrame(const uint8_t* p, size_t n){
@@ -349,11 +358,42 @@ size_t tryParseOne(){
 // ========================= SERVEUR WEB =========================
 WebServer server(80);
 
-// MQTT client
+// MQTT
 WiFiClient g_net;
 PubSubClient g_mqtt(g_net);
+    // ---- Idle Wi‑Fi OFF (Mode 3) ----
+    static bool wifiOff = false;
+    //static uint32_t lastActiveMs = 0;
+    const uint32_t WIFI_IDLE_OFF_MS = 60000;  // cut Wi‑Fi after 60 s idle (hysteresis pairing with KEEP_ON)
+    const uint32_t WIFI_KEEP_ON_MS  = 20000;  // keep Wi‑Fi ON 20 s after activity
+    //static inline void bumpActivity(){ lastActiveMs = millis(); }
+    static void wifiEnsureOn(){
+      if (!wifiOff) return;
+      WiFi.mode(WIFI_STA);
+      auto _c = WifiCfg::load();
+      String _ssid = _c.ssid.length()? _c.ssid : String(WIFI_SSID);
+      String _pass = _c.ssid.length()? _c.pass : String(WIFI_PASS);
+      WiFi.begin(_ssid.c_str(), _pass.c_str());
+      server.begin();
+      if (g_pw.mdns) { MDNS.begin("ld2451"); }
+      wifiOff = false;
+      Serial.println("[PWR] WiFi ON");
+    }
+    static void wifiEnsureOff(){
+      if (wifiOff) return;
+      if (g_pw.mdns) MDNS.end();
+      server.stop();
+      WiFi.disconnect(true, true);
+      WiFi.mode(WIFI_OFF);
+      wifiOff = true;
+      Serial.println("[PWR] WiFi OFF (idle)");
+    }
+    
 static MqttCfg::Settings g_mq;
-static uint32_t g_mqttNextTry = 0;
+// Power
+PowerCfg::Settings g_pw;
+//static bool g_ld2451_ok=false;
+
 
 // Reboot scheduling after Wi‑Fi save
 static bool g_rebootPending = false;
@@ -361,6 +401,7 @@ static uint32_t g_rebootAt = 0;
 
 // ----------- PAGE 1 : PASSAGES & STATS (auto-
 #include "web_ui.h"
+extern PowerCfg::Settings g_pw;
 
 
 // ---------------- MQTT helpers ------------------------------
@@ -375,10 +416,10 @@ static String topic(const String& leaf){
   return base + "/" + leaf;
 }
 static void publishJSON(const String& t, const String& json, bool retain=false){
-  if (g_mqtt.connected()) g_mqtt.publish(t.c_str(), json.c_str(), retain);
+  if (g_mqtt.connected()) { if(!g_mqtt.publish(t.c_str(), json.c_str(), retain)) Serial.printf("[MQTT] publish fail topic=%s len=%u\n", t.c_str(), (unsigned)json.length()); }
 }
 static void publishStr(const String& t, const String& s, bool retain=false){
-  if (g_mqtt.connected()) g_mqtt.publish(t.c_str(), s.c_str(), retain);
+  if (g_mqtt.connected()) { if(!g_mqtt.publish(t.c_str(), s.c_str(), retain)) Serial.printf("[MQTT] publish fail topic=%s len=%u\n", t.c_str(), (unsigned)s.length()); }
 }
 static void publishHAConfig(){
   if (!g_mq.discovery) return;
@@ -402,16 +443,18 @@ static void mqttEnsureConnected(){
   if (!g_mq.enabled) return;
   if (WiFi.status() != WL_CONNECTED) return;
   if (g_mqtt.connected()) { g_mqtt.loop(); return; }
+  static uint32_t g_mqttNextTry = 0;
   uint32_t now = millis();
   if (now < g_mqttNextTry) return;
   g_mqtt.setServer(g_mq.host.c_str(), g_mq.port ? g_mq.port : 1883);
   String willTopic = topic("status");
+  Serial.printf("[MQTT] connect to %s:%u user=%s\n", g_mq.host.c_str(), (unsigned)(g_mq.port?g_mq.port:1883), g_mq.user.c_str());
   g_mqtt.connect(("RADAR-"+devId()).c_str(),
                  g_mq.user.length()? g_mq.user.c_str(): nullptr,
                  g_mq.user.length()? g_mq.pass.c_str(): nullptr,
                  willTopic.c_str(), 0, true, "offline");
   g_mqttNextTry = now + 5000;
-  if (g_mqtt.connected()) mqttOnConnect();
+  if (g_mqtt.connected()) { Serial.println("[MQTT] connected"); mqttOnConnect(); } else { Serial.printf("[MQTT] connect failed, state=%d\n", g_mqtt.state()); }
 }
 static void mqttPublishPass(const Passage& p){
   if (!g_mqtt.connected()) return;
@@ -422,21 +465,48 @@ static void mqttPublishPass(const Passage& p){
   publishStr(topic("count"), String((unsigned)g_passes.size()), true);
 }
 
+// ---------------- Power policy (CPU/mdns/sleep) -------------------------
+static void applyPowerPolicy(){
+  setCpuFrequencyMhz((int)g_pw.cpu_mhz);
+
+  bool wantSleep = g_pw.wifi_sleep;
+  if (!g_ld2451_ok) wantSleep = false;
+  if (g_pw.sleep_gpio >= 0){
+    pinMode(g_pw.sleep_gpio, INPUT_PULLUP);
+    int lvl = digitalRead(g_pw.sleep_gpio);
+    bool active = g_pw.sleep_gpio_active_high ? (lvl==HIGH) : (lvl==LOW);
+    if (active) wantSleep = false;
+  }
+
+  if (wantSleep && g_pw.sleep_mode == 1){
+    WiFi.setSleep(true);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+  } else {
+    WiFi.setSleep(false);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+  }
+}
+
 // ----------- PAGE 2 : CONFIGURATION (pas d’au
 // ---------------- API Passages / Options -----------------------
-void handleWifiGet();
-void handleWifiSet();
+struct Passage; // fwd decl
+static void mqttPublishPass(const Passage& p);
+void handleMqttTest();
+static void applyPowerPolicy();
 void handleMqttGet();
 void handleMqttSet();
-static void mqttPublishPass(const Passage& p);
+void handlePowerGet();
+void handlePowerSet();
+void handleWifiGet();
+void handleWifiSet();
 void handlePasses(){
-  String j="["; for(size_t i=0;i<g_passes.size();++i){ const auto& p=g_passes[i]; if(i) j+=','; j+="{\"epoch\":"+String((long)p.ts)+",\"datetime\":\""+fmtDate(p.ts)+"\",\"dir\":"+(p.dir?String(1):String(0))+
+  bumpActivity(); String j="["; for(size_t i=0;i<g_passes.size();++i){ const auto& p=g_passes[i]; if(i) j+=','; j+="{\"epoch\":"+String((long)p.ts)+",\"datetime\":\""+fmtDate(p.ts)+"\",\"dir\":"+(p.dir?String(1):String(0))+
     ",\"speed_kmh\":"+String(p.speed_kmh)+",\"dist_m\":"+String(p.dist_m)+",\"angle_deg\":"+String((int)p.angle)+",\"snr\":"+String(p.snr)+"}"; } j+="]";
   server.send(200,"application/json",j);
 }
-void handleClear(){ g_passes.clear(); LittleFS.remove(CSV_PATH); server.send(200,"application/json","{\"ok\":1}"); }
+void handleClear(){ bumpActivity(); g_passes.clear(); LittleFS.remove(CSV_PATH); server.send(200,"application/json","{\"ok\":1}"); }
 void handleCSV(){
-  if (!LittleFS.exists(CSV_PATH)) {
+  bumpActivity(); if (!LittleFS.exists(CSV_PATH)) {
     File tmp=LittleFS.open(CSV_PATH, FILE_WRITE);
     if(!tmp){ server.send(500,"text/plain","CSV create error"); return; }
     tmp.println("epoch,datetime,direction,speed_kmh,dist_m,angle_deg,snr");
@@ -448,11 +518,11 @@ void handleCSV(){
   server.sendHeader("Content-Disposition","attachment; filename=passes.csv"); server.streamFile(f,"text/csv"); f.close();
 }
 void handleOptionsGet(){
-  String j = "{\"approach\":" + String(ONLY_APPROACH?1:0) + ",\"minspd\":" + String(MIN_SPEED) + ",\"debounce\":" + String(PASS_DEBOUNCE_MS) + "}";
+  bumpActivity(); String j = "{\"approach\":" + String(ONLY_APPROACH?1:0) + ",\"minspd\":" + String(MIN_SPEED) + ",\"debounce\":" + String(PASS_DEBOUNCE_MS) + "}";
   server.send(200,"application/json",j);
 }
 void handleOptionsSet(){
-  if (server.hasArg("approach")) ONLY_APPROACH = (server.arg("approach")=="1");
+  bumpActivity(); if (server.hasArg("approach")) ONLY_APPROACH = (server.arg("approach")=="1");
   if (server.hasArg("minspd"))   MIN_SPEED = (uint8_t)constrain(server.arg("minspd").toInt(),0,120);
   if (server.hasArg("debounce")) PASS_DEBOUNCE_MS = (uint32_t)constrain(server.arg("debounce").toInt(),200,5000);
   saveConfig();
@@ -489,7 +559,7 @@ bool setSensSync(const SensParams& in){
   return g_ack.status==0;
 }
 void handleCfgGet(){
-  String j="{";
+  bumpActivity(); String j="{";
   if (g_det.valid) j += "\"det\":{\"max\":"+String(g_det.maxDist_m)+",\"dir\":"+String(g_det.dirMode)+",\"minspd\":"+String(g_det.minSpeed_kmh)+",\"delay\":"+String(g_det.noTargetDelay_s)+"},";
   else j+="\"det\":null,";
   if (g_sens.valid) j += "\"sens\":{\"trig\":"+String(g_sens.trigCount)+",\"snr\":"+String(g_sens.snrLevel)+"},";
@@ -498,9 +568,9 @@ void handleCfgGet(){
   j += "\"applyBoot\":" + String(g_applyAtBoot?1:0) + "}";
   server.send(200,"application/json",j);
 }
-void handleCfgRead(){ bool ok1=readDetSync(g_det); bool ok2=readSensSync(g_sens); if (ok1||ok2) saveConfig(); server.send(200,"application/json", String("{\"ok\":") + (ok1&&ok2?"1}":"0}")); }
+void handleCfgRead(){ bumpActivity(); bool ok1=readDetSync(g_det); bool ok2=readSensSync(g_sens); if (ok1||ok2) saveConfig(); server.send(200,"application/json", String("{\"ok\":") + (ok1&&ok2?"1}":"0}")); }
 void handleCfgSet(){
-  DetParams d=g_det; SensParams s=g_sens;
+  bumpActivity(); DetParams d=g_det; SensParams s=g_sens;
   if (server.hasArg("max"))   d.maxDist_m       = (uint8_t)constrain(server.arg("max").toInt(), 1, 120);
   if (server.hasArg("dir"))   d.dirMode         = (uint8_t)constrain(server.arg("dir").toInt(), 0, 2);
   if (server.hasArg("minspd"))d.minSpeed_kmh    = (uint8_t)constrain(server.arg("minspd").toInt(), 0, 120);
@@ -512,7 +582,7 @@ void handleCfgSet(){
   server.send(200,"application/json", String("{\"ok\":") + (ok?"1}":"0}"));
 }
 void handleCfgBaud(){
-  int idx = constrain(server.arg("idx").toInt(), 1, 8);
+  bumpActivity(); int idx = constrain(server.arg("idx").toInt(), 1, 8);
   uint8_t v[2] = { (uint8_t)(idx & 0xFF), (uint8_t)(idx>>8) };
   cmd_enableCfg(); waitAck(CMD_ENABLE_CFG, 800);
   sendCmd(CMD_SET_BAUD, v, 2); bool ok = waitAck(CMD_SET_BAUD, 2000);
@@ -529,7 +599,7 @@ void applyPresetValues(const String& name, DetParams& d, SensParams& s){
   else            { d.maxDist_m=20; d.dirMode=2;  d.minSpeed_kmh=10; d.noTargetDelay_s=1; s.trigCount=1; s.snrLevel=4; }
 }
 void handleCfgPreset(){
-  String name = server.arg("name");
+  bumpActivity(); String name = server.arg("name");
   if (name!="ped" && name!="car"){ server.send(400,"application/json","{\"ok\":0}"); return; }
   DetParams d=g_det; SensParams s=g_sens; applyPresetValues(name,d,s);
   bool ok = setDetSync(d) && setSensSync(s); if (ok){ g_det=d; g_sens=s; saveConfig(); }
@@ -537,11 +607,11 @@ void handleCfgPreset(){
 }
 
 // BLE placeholder (non documenté via UART)
-void handleCfgBle(){ server.send(200,"application/json","{\"supported\":0,\"ok\":0}"); }
+void handleCfgBle(){ bumpActivity(); server.send(200,"application/json","{\"supported\":0,\"ok\":0}"); }
 
 // ---------------------- DIAG PING ------------------------------
 void handleDiagPing(){
-  cmd_enableCfg(); bool a = waitAck(CMD_ENABLE_CFG, 800);
+  bumpActivity(); cmd_enableCfg(); bool a = waitAck(CMD_ENABLE_CFG, 800);
   cmd_readVersion(); bool b = waitAck(CMD_READ_VERSION, 1500);
   cmd_endCfg(); bool c = waitAck(CMD_END_CFG, 800);
   char buf[160];
@@ -556,13 +626,14 @@ void setupWiFi(){
   WiFi.mode(WIFI_STA); auto _c = WifiCfg::load();
   String _ssid = _c.ssid.length()? _c.ssid : String(WIFI_SSID);
   String _pass = _c.ssid.length()? _c.pass : String(WIFI_PASS);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(_ssid.c_str(), _pass.c_str());
   Serial.printf("[WIFI] Connexion à %s ...\n", WIFI_SSID);
   uint32_t t0=millis(); bool ok=false; while (millis()-t0<10000){ if (WiFi.status()==WL_CONNECTED){ ok=true; break; } delay(200); }
   if (!ok){ WiFi.mode(WIFI_AP); WiFi.softAP(AP_SSID, AP_PASS); IPAddress ip=WiFi.softAPIP(); Serial.printf("[AP] SSID=%s PASS=%s IP=%s\n", AP_SSID, AP_PASS, ip.toString().c_str()); }
   else {
     Serial.printf("[WIFI] OK  IP=%s\n", WiFi.localIP().toString().c_str());
-    if (MDNS.begin("ld2451")) Serial.println("[MDNS] http://ld2451.local");
+    //if (MDNS.begin("ld2451")) Serial.println("[MDNS] http://ld2451.local");
     configTzTime(TZ_EUROPE_PARIS, "pool.ntp.org","time.google.com","time.cloudflare.com");
   }
 }
@@ -617,11 +688,20 @@ void setup() {
   server.on("/api/diag/ping", HTTP_GET, handleDiagPing);
   server.on("/api/mqtt/get", HTTP_GET, handleMqttGet);
   server.on("/api/mqtt/set", HTTP_GET, handleMqttSet);
+  server.on("/api/power/get", HTTP_GET, handlePowerGet);
+  server.on("/api/power/set", HTTP_GET, handlePowerSet);
+  server.on("/api/power/diag", HTTP_GET, handlePowerDiag);
+  server.on("/api/mqtt/test", HTTP_GET, handleMqttTest);
 
     server.on("/api/wifi/get", HTTP_GET, handleWifiGet);
   server.on("/api/wifi/set", HTTP_GET, handleWifiSet);
   g_mq = MqttCfg::load();
+  g_pw = PowerCfg::load();
+  applyPowerPolicy();
+  g_mqtt.setBufferSize(1024);
+  g_mqtt.setKeepAlive(30);
   server.begin(); Serial.println("[WEB] http server started");
+  lastActiveMs = millis();
 }
 
 void loop() {
@@ -629,6 +709,26 @@ void loop() {
   while (tryParseOne()) {}
   server.handleClient();
   mqttEnsureConnected();
+  // ---- Mode 3: Wi‑Fi OFF when idle ----
+  bool allowSleep = g_pw.wifi_sleep && g_ld2451_ok;
+  if (g_pw.sleep_gpio >= 0){
+    pinMode(g_pw.sleep_gpio, INPUT_PULLUP);
+    int lvl = digitalRead(g_pw.sleep_gpio);
+    bool active = g_pw.sleep_gpio_active_high ? (lvl==HIGH) : (lvl==LOW);
+    if (active) allowSleep = false;   // permanent override
+  }
+  if (allowSleep && g_pw.sleep_mode == 3){
+    uint32_t nowMs = millis();
+    bool shouldBeOn = (nowMs - lastActiveMs) < WIFI_KEEP_ON_MS;
+    if (shouldBeOn) wifiEnsureOn();
+    else            wifiEnsureOff();
+  } else {
+    if (wifiOff) wifiEnsureOn();
+  }
+
+  
+  maybeDoLightSleep();
+static uint32_t _lastPol=0; uint32_t _now=millis(); if (_now-_lastPol>1000){ applyPowerPolicy(); _lastPol=_now; }
   if (g_rebootPending && millis() >= g_rebootAt) { ESP.restart(); }
   static uint32_t hb=0; if (millis()-hb>30000){ hb=millis(); Serial.printf("[HB] bytes=%lu data=%lu ack=%lu pass=%u baud=%u\n",
     (unsigned long)ST.bytes_rx,(unsigned long)ST.frames_data,(unsigned long)ST.frames_ack,(unsigned)g_passes.size(),(unsigned)g_uart_baud); }
@@ -637,12 +737,12 @@ void loop() {
 
 // ---------------- Wi‑Fi credentials API ------------------------
 void handleWifiGet(){
-  auto c = WifiCfg::load();
+  bumpActivity(); auto c = WifiCfg::load();
   String j = String("{\"ssid\":\"") + (c.ssid.length()?c.ssid:String("")) + "\"}";
   server.send(200, "application/json", j);
 }
 void handleWifiSet(){
-  String ssid = server.hasArg("ssid") ? server.arg("ssid") : "";
+  bumpActivity(); String ssid = server.hasArg("ssid") ? server.arg("ssid") : "";
   String pass = server.hasArg("pass") ? server.arg("pass") : "";
   auto cur = WifiCfg::load();
   if (pass.length() == 0) pass = cur.pass;
@@ -652,30 +752,132 @@ void handleWifiSet(){
 }
 
 
-// ---------------- MQTT API (definitions) -----------------------
+
+// ---- MQTT test endpoint ----
+void handleMqttTest(){
+  bumpActivity(); mqttEnsureConnected();
+  // ---- Mode 3: Wi‑Fi OFF when idle ----
+  bool allowSleep = g_pw.wifi_sleep && g_ld2451_ok;
+  if (g_pw.sleep_gpio >= 0){
+    pinMode(g_pw.sleep_gpio, INPUT_PULLUP);
+    int lvl = digitalRead(g_pw.sleep_gpio);
+    bool active = g_pw.sleep_gpio_active_high ? (lvl==HIGH) : (lvl==LOW);
+    if (active) allowSleep = false;   // permanent override
+  }
+  if (allowSleep && g_pw.sleep_mode == 3){
+    uint32_t nowMs = millis();
+    bool shouldBeOn = (nowMs - lastActiveMs) < WIFI_KEEP_ON_MS;
+    if (shouldBeOn) wifiEnsureOn();
+    else            wifiEnsureOff();
+  } else {
+    if (wifiOff) wifiEnsureOn();
+  }
+
+  publishStr(topic("status"), "online", true);
+  publishStr(topic("count"), String((unsigned)g_passes.size()), true);
+  String j = String("{\"ts\":\"")+fmtDate(nowLocal())+"\",\"dir\":1,\"speed_kmh\":42,\"dist_m\":12,\"angle\":5,\"snr\":9}";
+  publishJSON(topic("last"), j, true);
+  server.send(200, "text/plain", "MQTT test published");
+}
+
+
+
+// ------------- Power diagnostics endpoint ------------------
+void handlePowerDiag(){
+  bumpActivity(); wifi_ps_type_t ps = WIFI_PS_NONE;
+  esp_wifi_get_ps(&ps);
+
+  int gpio_lvl = -1;
+  bool gpio_active = false;
+  if (g_pw.sleep_gpio >= 0) {
+    pinMode(g_pw.sleep_gpio, INPUT_PULLUP);
+    gpio_lvl = digitalRead(g_pw.sleep_gpio);
+    gpio_active = g_pw.sleep_gpio_active_high ? (gpio_lvl==HIGH) : (gpio_lvl==LOW);
+  }
+
+  String j = String("{\"cpu_cfg\":") + String((unsigned)g_pw.cpu_mhz) +
+             ",\"cpu_cur\":" + String((unsigned)getCpuFrequencyMhz()) +
+             ",\"mdns_cfg\":" + String(g_pw.mdns ? "true":"false") +
+             ",\"wifi_sleep_cfg\":" + String(g_pw.wifi_sleep ? "true":"false") +
+             ",\"wifi_sleep_rt\":" + String(WiFi.getSleep() ? "true":"false") +
+             ",\"wifi_ps\":" + String((int)ps) +
+             ",\"ld2451_ok\":" + String(g_ld2451_ok ? "true":"false") +
+             ",\"gpio\":" + String((int)g_pw.sleep_gpio) +
+             ",\"gpio_lvl\":" + String(gpio_lvl) +
+             ",\"gpio_active\":" + String(gpio_active ? "true":"false") +
+             "}";
+  server.send(200, "application/json", j);
+}
+
+
+// ---------------- MQTT API ----------------------------------
 void handleMqttGet(){
+  bumpActivity(); // nécessite: #include "mqtt_cfg.h" et une variable globale MqttCfg::Settings g_mq
   g_mq = MqttCfg::load();
-  String j = String("{\"enabled\":") + (g_mq.enabled?"true":"false") +
-             ",\"host\":\""+ g_mq.host + "\"" +
-             ",\"port\":"+ String((unsigned)g_mq.port) +
-             ",\"user\":\""+ g_mq.user + "\"" +
-             ",\"base\":\""+ g_mq.base + "\"" +
-             ",\"discovery\":"+ (g_mq.discovery?"true":"false") +
+  String j = String("{\"enabled\":") + (g_mq.enabled ? "true" : "false") +
+             ",\"host\":\"" + g_mq.host + "\"" +
+             ",\"port\":" + String((unsigned)g_mq.port) +
+             ",\"user\":\"" + g_mq.user + "\"" +
+             ",\"base\":\"" + g_mq.base + "\"" +
+             ",\"discovery\":" + String(g_mq.discovery ? "true" : "false") +
              "}";
   server.send(200, "application/json", j);
 }
 
 void handleMqttSet(){
-  MqttCfg::Settings s = MqttCfg::load();
-  if (server.hasArg("enabled")) s.enabled = (server.arg("enabled")=="1");
+  bumpActivity(); MqttCfg::Settings s = MqttCfg::load();
+  if (server.hasArg("enabled")) s.enabled = (server.arg("enabled") == String("1"));
   if (server.hasArg("host"))    s.host = server.arg("host");
-  if (server.hasArg("port"))    s.port = (uint16_t)constrain(server.arg("port").toInt(), 1, 65535);
+  if (server.hasArg("port"))    s.port = (uint16_t) constrain(server.arg("port").toInt(), 1, 65535);
   if (server.hasArg("user"))    s.user = server.arg("user");
-  if (server.hasArg("pass")){   String np = server.arg("pass"); if (np.length()>0) s.pass = np; }
+  if (server.hasArg("pass"))  { String np = server.arg("pass"); if (np.length() > 0) s.pass = np; }
   if (server.hasArg("base"))    s.base = server.arg("base");
-  if (server.hasArg("disc"))    s.discovery = (server.arg("disc")=="1");
+  if (server.hasArg("disc"))    s.discovery = (server.arg("disc") == String("1"));
   bool ok = MqttCfg::save(s);
-  server.send(ok?200:500, "text/plain", ok?"OK":"ERR");
-  if (ok) { g_rebootPending = true; g_rebootAt = millis() + 800; }
+  server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "ERR");
+  if (ok) { g_rebootPending = true; g_rebootAt = millis() + 800; } // reboot auto si tu as ces variables globales
 }
 
+// ---------------- Power config API ---------------------------
+void handlePowerGet(){
+  bumpActivity(); // nécessite: #include "power_cfg.h" et une variable globale PowerCfg::Settings g_pw
+  g_pw = PowerCfg::load();
+  String j = String("{\"cpu_mhz\":") + String((unsigned)g_pw.cpu_mhz) +
+             ",\"mdns\":" + String(g_pw.mdns ? "true" : "false") +
+             ",\"wifi_sleep\":" + String(g_pw.wifi_sleep ? "true" : "false") +
+             ",\"sleep_gpio\":" + String((int)g_pw.sleep_gpio) +
+             ",\"sleep_gpio_ah\":" + String(g_pw.sleep_gpio_active_high ? "true" : "false") +
+             "}";
+  server.send(200, "application/json", j);
+}
+
+void handlePowerSet(){
+  bumpActivity(); PowerCfg::Settings s = PowerCfg::load();
+  if (server.hasArg("cpu"))  s.cpu_mhz = (uint16_t) server.arg("cpu").toInt();           // 80/160/240
+  if (server.hasArg("mdns")) s.mdns = (server.arg("mdns") == String("1"));
+  if (server.hasArg("wsl"))  s.wifi_sleep = (server.arg("wsl") == String("1"));
+  if (server.hasArg("gpio")) s.sleep_gpio = (int8_t) server.arg("gpio").toInt();
+  if (server.hasArg("gah"))  s.sleep_gpio_active_high = (server.arg("gah") == String("1"));
+  if (server.hasArg("slm")) s.sleep_mode = (uint8_t) server.arg("slm").toInt();
+  bool ok = PowerCfg::save(s);
+  server.send(ok ? 200 : 500, "text/plain", ok ? "OK" : "ERR");
+  if (ok) { g_rebootPending = true; g_rebootAt = millis() + 800; } // reboot auto
+}
+
+// Light-sleep par tranches quand "Mode de veille = Light sleep"
+static void maybeDoLightSleep(){
+  // Actif seulement si Sleep ON + mode=2 (Light) + radar OK + pas d’override GPIO
+  if (!(g_pw.wifi_sleep && g_pw.sleep_mode == 2)) return;
+  if (!g_ld2451_ok) return;
+  if (g_pw.sleep_gpio >= 0){
+    pinMode(g_pw.sleep_gpio, INPUT_PULLUP);
+    int lvl = digitalRead(g_pw.sleep_gpio);
+    bool active = g_pw.sleep_gpio_active_high ? (lvl==HIGH) : (lvl==LOW);
+    if (active) return; // override actif → pas de sleep
+  }
+
+  // tranche ~150 ms (à ajuster si besoin)
+  esp_sleep_enable_timer_wakeup(150000); // 150 ms
+  Serial.flush();
+  esp_light_sleep_start(); // réveil sur timer
+}
