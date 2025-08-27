@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Configuration radar</title>
+<style>
+  body{font-family:system-ui,Arial;margin:16px;max-width:860px}
+  h1{font-size:20px;margin:0 0 12px;display:flex;align-items:center;gap:12px}
+  label{display:block;margin-top:10px;font-weight:600}
+  input[type=text],input[type=number]{width:100%;padding:8px;border:1px solid #ccc;border-radius:6px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .col{flex:1;min-width:220px}
+  .btn{padding:9px 14px;border:1px solid #888;border-radius:6px;background:#fff;cursor:pointer;margin-top:12px}
+  .muted{color:#666}
+  .ok{color:#0a7;font-weight:600}
+  .ko{color:#d33;font-weight:600}
+  .status{padding:8px;border:1px solid #ddd;border-radius:6px;margin:8px 0;background:#fafafa}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:12px}
+  .card{border:1px solid #ddd;border-radius:8px;padding:10px}
+</style>
+</head>
+<body>
+  <h1><img id="lg" height="32" onerror="this.style.display='none'"> Configuration radar</h1>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Wi-Fi</h3>
+      <div class="status" id="wifiBox">Wi-Fi : chargement…</div>
+      <div class="row">
+        <div class="col">
+          <label>SSID (STA)</label>
+          <input id="sta_ssid" type="text" placeholder="SSID du Wi-Fi client">
+        </div>
+        <div class="col">
+          <label>Mot de passe</label>
+          <input id="sta_pass" type="text" placeholder="Mot de passe Wi-Fi">
+        </div>
+      </div>
+      <button class="btn" onclick="save()">Enregistrer</button>
+    </div>
+
+    <div class="card">
+      <h3>ROI & vitesses</h3>
+      <div class="row">
+        <div class="col">
+          <label>ROI min (m)</label>
+          <input id="roi_min_m" type="number" step="0.1" min="0" value="6">
+        </div>
+        <div class="col">
+          <label>ROI max (m)</label>
+          <input id="roi_max_m" type="number" step="0.1" min="0" value="60">
+        </div>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label>Seuil vitesse min (km/h)</label>
+          <input id="min_v_kmh" type="number" step="0.1" min="0" value="3.6">
+        </div>
+        <div class="col">
+          <label>Vitesse limite (km/h)</label>
+          <input id="speed_limit_kmh" type="number" step="1" min="0" value="50">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>RTC (PCF8563)</h3>
+      <div class="status" id="rtcBox">RTC : chargement…</div>
+      <button class="btn" onclick="setRTC()">Mettre à l'heure (depuis ce navigateur)</button>
+      <p class="muted">Hors-ligne : la RTC fournit l'heure. Ce bouton envoie l'epoch local du navigateur.</p>
+    </div>
+  </div>
+
+  <div style="margin-top:12px">
+    <a class="btn" href="/">Retour</a>
+    <span id="status"></span>
+  </div>
+
+  <script>
+    document.getElementById('lg').src = '/logo?_ts=' + Date.now();
+
+    function setStatus(text, ok){
+      const s=document.getElementById('status'); s.textContent=text; s.className = ok?'ok':'ko';
+    }
+    function wifiStatusHtml(j){
+      let s = `AP : <b>${j.ap_ssid}</b> — IP ${j.ap_ip || '-'}`;
+      if(j.sta_ssid){
+        s += `<br>STA : <b>${j.sta_ssid}</b> — ${j.sta_connected? 'connecté' : 'non connecté'}`;
+        if(j.sta_connected) s += ` — IP ${j.sta_ip} — RSSI ${j.rssi} dBm`;
+      } else {
+        s += `<br>STA : (non configuré)`;
+      }
+      return s;
+    }
+    async function loadWifiBox(){
+      try{
+        const r = await fetch('/api/wifi?_ts='+Date.now(),{cache:'no-store'});
+        const j = await r.json();
+        document.getElementById('wifiBox').innerHTML = wifiStatusHtml(j);
+      }catch(e){
+        document.getElementById('wifiBox').textContent = 'Wi-Fi : indisponible';
+      }
+    }
+    async function loadRTCBox(){
+      try{
+        const r = await fetch('/api/rtc?_ts='+Date.now(),{cache:'no-store'});
+        const j = await r.json();
+        const d = new Date((j.epoch||0)*1000);
+        document.getElementById('rtcBox').innerHTML =
+          `Présent : <b>${j.present?'oui':'non'}</b>` +
+          `<br>Perte d'alim : <b>${j.lostPower?'oui':'non'}</b>` +
+          `<br>Heure actuelle : <b>${d.toLocaleString()}</b>`;
+      }catch(e){
+        document.getElementById('rtcBox').textContent = 'RTC : indisponible';
+      }
+    }
+    async function loadCfg(){
+      const r = await fetch('/api/config?_ts='+Date.now(), {cache:'no-store'});
+      const j = await r.json();
+      for(const k of ['sta_ssid','roi_min_m','roi_max_m','min_v_kmh','speed_limit_kmh']){ if(j[k]!=null) document.getElementById(k).value=j[k]; }
+    }
+    async function save(){
+      const body = {
+        sta_ssid: document.getElementById('sta_ssid').value,
+        sta_pass: document.getElementById('sta_pass').value,
+        roi_min_m: parseFloat(document.getElementById('roi_min_m').value),
+        roi_max_m: parseFloat(document.getElementById('roi_max_m').value),
+        min_v_kmh: parseFloat(document.getElementById('min_v_kmh').value),
+        speed_limit_kmh: parseFloat(document.getElementById('speed_limit_kmh').value)
+      };
+      const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const j = await r.json();
+      setStatus(j.ok ? (j.sta_connected ? `Enregistré. Connecté STA (${j.sta_ip}).` : 'Enregistré. STA non connecté.') : 'Échec.', !!j.ok);
+      await loadWifiBox();
+    }
+    async function setRTC(){
+      const epoch = Math.round(Date.now()/1000);
+      const r = await fetch('/api/rtc',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({epoch})});
+      const j = await r.json();
+      if(j.ok){ setStatus('RTC mise à l\'heure.', true); } else { setStatus('Erreur mise à l\'heure RTC.', false); }
+      await loadRTCBox();
+    }
+    (async ()=>{ await loadCfg(); await loadWifiBox(); await loadRTCBox(); })();
+  </script>
+</body>
+</html>

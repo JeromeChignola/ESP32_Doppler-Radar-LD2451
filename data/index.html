@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Radar LD2451 – Comptage & Vitesses</title>
+<style>
+  body{font-family:system-ui,Arial;margin:16px}
+  h1{font-size:20px;margin:0 0 12px}
+  .row{display:flex;gap:16px;flex-wrap:wrap}
+  .card{border:1px solid #ddd;border-radius:8px;padding:12px;flex:1;min-width:300px}
+  canvas{max-width:100%;height:300px}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:6px;border-bottom:1px solid #eee;text-align:right}
+  th{background:#f7f7f7;text-align:center}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .btn{padding:8px 12px;border:1px solid #888;border-radius:6px;background:#fff;cursor:pointer}
+  .muted{color:#666;font-size:13px}
+  .dirp{color:#0a7}
+  .dirn{color:#d33}
+  .header{display:flex;align-items:center;gap:12px;margin-bottom:8px}
+  .logo{height:36px;width:auto}
+</style>
+</head>
+<body>
+  <div class="header">
+    <img id="logo" alt="Logo" class="logo" onerror="this.style.display='none'">
+    <h1>Radar LD2451 – Comptage & Vitesses</h1>
+  </div>
+  <div class="toolbar">
+    <a class="btn" href="/logs.csv">CSV</a>
+    <a class="btn" href="/report" target="_blank">Rapport PDF</a>
+    <a class="btn" href="/config.html">Configuration</a>
+    <button id="testOnce" class="btn" onclick="testOnce()">Passage test</button>
+    <span class="muted" id="status"></span>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h3>Comptes par heure</h3>
+      <canvas id="counts"></canvas>
+    </div>
+    <div class="card">
+      <h3>Vitesse moyenne (km/h) par heure</h3>
+      <canvas id="avg"></canvas>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>Derniers passages</h3>
+    <table id="t">
+      <thead><tr>
+        <th style="text-align:left">Date/heure</th>
+        <th>Vitesse (km/h)</th>
+        <th>Direction</th>
+        <th>Distance (m)</th>
+        <th>Angle (°)</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+    <p class="muted">Sens : <span class="dirp">+1 = approche</span>, <span class="dirn">-1 = éloignement</span></p>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    document.getElementById('logo').src = '/logo?_ts=' + Date.now();
+    const elStatus = document.getElementById('status');
+    let chartsBuilt = false, chartCounts, chartAvg;
+
+    async function loadStats(){
+      const r = await fetch('/api/stats', {cache:'no-store'}); const j = await r.json();
+      const labels = [...Array(24)].map((_,i)=>i+'h');
+      const counts = j.counts || new Array(24).fill(0);
+      const avg = j.avg_kmh || new Array(24).fill(0);
+      if(!chartsBuilt){
+        const ctx1 = document.getElementById('counts').getContext('2d');
+        chartCounts = new Chart(ctx1,{type:'bar',data:{labels,datasets:[{label:'Passages',data:counts}]},
+          options:{scales:{y:{beginAtZero:true}}}});
+        const ctx2 = document.getElementById('avg').getContext('2d');
+        chartAvg = new Chart(ctx2,{type:'line',data:{labels,datasets:[{label:'km/h',data:avg,tension:0.2}]},
+          options:{scales:{y:{beginAtZero:true}}}});
+        chartsBuilt = true;
+      } else {
+        chartCounts.data.datasets[0].data = counts; chartCounts.update('none');
+        chartAvg.data.datasets[0].data = avg; chartAvg.update('none');
+      }
+    }
+
+    async function loadLast(){
+      const r = await fetch('/api/last?n=100&_ts=' + Date.now(), {cache:'no-store'}); const j = await r.json();
+      const tb = document.querySelector('#t tbody'); tb.innerHTML='';
+      (j.passes||[]).forEach(p=>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td style="text-align:left">${p.datetime||''}</td>
+          <td>${(p.speed_kmh||0).toFixed(1)}</td>
+          <td class="${p.dir>=0?'dirp':'dirn'}">${p.dir>=0?'+1':'-1'}</td>
+          <td>${p.distance_m?.toFixed? p.distance_m.toFixed(1): ''}</td>
+          <td>${p.angle_deg?.toFixed? p.angle_deg.toFixed(1): ''}`;
+        tb.appendChild(tr);
+      });
+      elStatus.textContent = `Dernière mise à jour: ${new Date().toLocaleTimeString()}`;
+    }
+
+    async function testOnce(){ await fetch('/api/test?_ts='+Date.now(), {cache:'no-store'}); await loadLast(); }
+
+    (async ()=>{ await loadStats(); await loadLast(); setInterval(loadLast, 5000); })();
+  </script>
+</body>
+</html>
